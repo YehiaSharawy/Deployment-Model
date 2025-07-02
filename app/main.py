@@ -2,16 +2,11 @@ import os
 import uuid
 import shutil
 import zipfile
-import pydicom
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 
-from app.dicom2nifti_utils import convert_dicom_to_nifti
-from app.nnunet_runner import run_nnunet_inference
-from app.file_utils import prepare_nnunet_input, save_uploaded_file
-
-
+from app.dicom2nifti_utils import convert_dicom_to_nifti_slices
+from app.nnunet_runner import run_nnunet_inference_on_slice
 
 app = FastAPI()
 
@@ -23,30 +18,42 @@ async def upload_and_segment(file: UploadFile = File(...)):
     upload_folder = os.path.join(UPLOADS_ROOT, upload_id)
     os.makedirs(upload_folder, exist_ok=True)
     zip_path = os.path.join(upload_folder, "dicoms.zip")
-    save_uploaded_file(file, zip_path)
+    with open(zip_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(upload_folder)
     os.remove(zip_path)
 
-    dicom_folder = upload_folder
-    output_nifti = os.path.join(upload_folder, "output.nii.gz")
-
+    single_slice_folder = os.path.join(upload_folder, "slices")
     try:
-        convert_dicom_to_nifti(dicom_folder, output_nifti)
+        niftis = convert_dicom_to_nifti_slices(upload_folder, single_slice_folder)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"DICOM to NIfTI failed: {e}"})
 
-    # --- HERE: prepare input folder for nnUNet ---
-    nnunet_input_dir = prepare_nnunet_input(upload_folder, output_nifti)
-    # ---------------------------------------------
+    output_slices_folder = os.path.join(upload_folder, "nnunet_out")
+    os.makedirs(output_slices_folder, exist_ok=True)
+    outputs = []
 
-    try:
-        seg_path = run_nnunet_inference(nnunet_input_dir)
-    except Exception as e:
-        return JSONResponse(status_code=500, content={"error": f"nnUNet inference failed: {e}"})
+    for nifti_path in niftis:
+        nnunet_input_dir = os.path.join(upload_folder, "nnunet_input", os.path.basename(nifti_path)[:-7])
+        os.makedirs(nnunet_input_dir, exist_ok=True)
+        nnunet_case = os.path.join(nnunet_input_dir, "case_0000.nii.gz")
+        shutil.copy(nifti_path, nnunet_case)
+        try:
+            seg_path = run_nnunet_inference_on_slice(nnunet_input_dir)
+            output_path = os.path.join(output_slices_folder, os.path.basename(seg_path))
+            shutil.move(seg_path, output_path)
+            outputs.append(output_path)
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": f"nnUNet inference failed on {nifti_path}: {e}"})
 
-    return FileResponse(seg_path, media_type="application/gzip", filename=os.path.basename(seg_path))
+    output_zip = os.path.join(upload_folder, "all_segmentations.zip")
+    with zipfile.ZipFile(output_zip, "w") as zipf:
+        for out_file in outputs:
+            zipf.write(out_file, os.path.basename(out_file))
+
+    return FileResponse(output_zip, media_type="application/zip", filename="all_segmentations.zip")
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
@@ -65,26 +72,3 @@ def read_root():
     </body>
     </html>
     """
-
-def find_dicom_folder(root_folder):
-    # Walk the directory tree, look for first folder with .dcm files (or any file that looks like DICOM)
-    for dirpath, _, filenames in os.walk(root_folder):
-        for fname in filenames:
-            try:
-                # Try to open the file as DICOM
-                pydicom.dcmread(os.path.join(dirpath, fname), stop_before_pixels=True)
-                return dirpath
-            except Exception:
-                continue
-    raise Exception(f"No DICOM files found in folder: {root_folder}")
-
-
-def prepare_nnunet_input(upload_folder, output_nifti):
-    # Make a clean input folder for nnUNet
-    nnunet_input_dir = os.path.join(upload_folder, "nnunet_case")
-    os.makedirs(nnunet_input_dir, exist_ok=True)
-
-    # nnUNet expects <caseid>_0000.nii.gz, use a generic name
-    nnunet_case = os.path.join(nnunet_input_dir, "case_0000.nii.gz")
-    shutil.copy(output_nifti, nnunet_case)
-    return nnunet_input_dir
